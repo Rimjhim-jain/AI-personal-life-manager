@@ -1,7 +1,7 @@
-python-telegram-bot[job-queue]==20.7
-groq==0.4.2
-apscheduler==3.10.4
-pydantic==2.5.3
-python-dotenv==1.0.0
-requests==2.31.0
-dateparser==1.2.0
+python-telegram-bot[job-queue]>=22
+groq>=0.13
+apscheduler>=3.10.4,<4
+pydantic>=2.9
+python-dotenv>=1.0
+requests>=2.32
+dateparser>=1.2

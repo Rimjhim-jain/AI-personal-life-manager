@@ -18,6 +18,8 @@ Commands:
   /done <prefix><id> — mark complete  (s5 = shopping #5, l3 = learning #3, o2 = others #2)
 """
 
+
+
 import json
 import logging
 from datetime import date, time
@@ -316,6 +318,11 @@ async def _daily_job(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
+
+    import os
+    print("Token loaded:", repr(TELEGRAM_TOKEN))
+    print("Current dir:", os.getcwd())
+    print(".env exists:", os.path.exists(".env"))
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
