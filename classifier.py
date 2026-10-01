@@ -17,7 +17,7 @@ from config import GROQ_API_KEY, JEV_API_KEY, CONFIDENCE_MEDIUM
 
 logger = logging.getLogger(__name__)
 
-INTENTS = ["shopping", "learning", "expense", "reminder", "other"]
+INTENTS = ["shopping", "learning", "expense", "reminder", "query", "other"]
 
 _GROQ_SYSTEM_PROMPT = """You are an intent classifier for a personal life manager app.
 
@@ -26,16 +26,18 @@ Classify the user's message into one or more of these intents:
 - learning   : user wants to study, learn, read, or understand something
 - expense    : user spent, paid, or recorded money
 - reminder   : user wants to be reminded about something (appointments, tasks)
+- query      : user is ASKING for their stored data (show me, what did I, give me, list my, total, summary, plans)
 - other      : anything else
 
 Return ONLY valid JSON in this exact format:
-{"classifications": [{"intent": "shopping", "confidence": 0.95}, {"intent": "expense", "confidence": 0.88}]}
+{{"classifications": [{{"intent": "shopping", "confidence": 0.95}}, {{"intent": "expense", "confidence": 0.88}}]}}
 
 Rules:
 - A single message CAN have multiple intents — include ALL that apply
 - confidence is a float between 0.0 and 1.0
 - Only include intents with confidence > 0.5
-- Be precise with confidence: 0.95+ = very clear signal, 0.7 = likely, 0.55 = possible"""
+- Be precise with confidence: 0.95+ = very clear signal, 0.7 = likely, 0.55 = possible
+- 'query' is RETRIEVAL (asking), all others are STORAGE (telling). Never mix query with storage intents."""
 
 
 def _classify_with_jev(text: str) -> List[Classification]:
@@ -70,7 +72,7 @@ def _classify_with_groq(text: str) -> List[Classification]:
     from groq import Groq
     client = Groq(api_key=GROQ_API_KEY)
     resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[
             {"role": "system", "content": _GROQ_SYSTEM_PROMPT},
             {"role": "user", "content": text},

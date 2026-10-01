@@ -39,6 +39,9 @@ import extractor as ext
 import rules
 from classifier import classify
 from gate import decide
+from query_handler import handle_query
+from mailer import send_report
+from scheduler import schedule_entry, restore_all
 from config import CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, TELEGRAM_TOKEN
 from models import Classification
 from notifier import send_daily_notifications
@@ -68,8 +71,24 @@ def _fmt_date(d) -> str:
         return str(d)
 
 
-async def _save_and_format(intent: str, text: str, extraction_path: str) -> str:
-    """Extract, store, and return a confirmation line for one intent."""
+def _schedule_if_timed(job_queue, chat_id: int, tbl: str, row_id: int, entry) -> str:
+    """If entry has a reminder_time, schedule it and return a suffix string."""
+    if not entry.reminder_time or not entry.date:
+        return ""
+    schedule_entry(
+        job_queue, chat_id, tbl, row_id,
+        date_str=str(entry.date),
+        time_str=entry.reminder_time,
+        description=getattr(entry, "topic", None)
+                    or ", ".join(getattr(entry, "items", []))
+                    or getattr(entry, "description", "Reminder"),
+    )
+    return f" · reminder at {entry.reminder_time}"
+
+
+async def _save_and_format(intent: str, text: str, extraction_path: str,
+                           job_queue=None, chat_id: int = 0) -> str:
+    """Extract, store, schedule (if timed), and return a confirmation line."""
     if intent == "expense":
         if extraction_path == "rules":
             entry = rules.try_extract_expense(text, text)
@@ -82,29 +101,45 @@ async def _save_and_format(intent: str, text: str, extraction_path: str) -> str:
 
     if intent == "shopping":
         entry = ext.extract_shopping(text)
-        db.add_shopping(entry)
+        if entry.date is None:
+            import datetime
+            entry = entry.model_copy(update={"date": datetime.date.today()})
+        row_id = db.add_shopping(entry)
+        suffix = _schedule_if_timed(job_queue, chat_id, "shopping", row_id, entry) if job_queue else ""
         items = ", ".join(entry.items)
-        return f"✅  Shopping: {items} → {_fmt_date(entry.date)}"
+        return f"✅  Shopping: {items} → {_fmt_date(entry.date)}{suffix}"
 
     if intent == "learning":
         entry = ext.extract_learning(text)
-        db.add_learning(entry)
-        return f"📚  Learning: {entry.topic} → {_fmt_date(entry.date)}"
+        row_id = db.add_learning(entry)
+        suffix = _schedule_if_timed(job_queue, chat_id, "learning", row_id, entry) if job_queue else ""
+        return f"📚  Learning: {entry.topic} → {_fmt_date(entry.date)}{suffix}"
 
     # reminder / other
     entry = ext.extract_other(text)
-    db.add_other(entry)
-    return f"📌  Reminder: {entry.description} → {_fmt_date(entry.date)}"
+    row_id = db.add_other(entry)
+    suffix = _schedule_if_timed(job_queue, chat_id, "others", row_id, entry) if job_queue else ""
+    return f"📌  Reminder: {entry.description} → {_fmt_date(entry.date)}{suffix}"
 
 
-async def _process(text: str, classifications: list[Classification]) -> list[str]:
-    """Run the fast-gate decision and extract+store all detected intents."""
+async def _process(text: str, classifications: list[Classification],
+                   job_queue=None, chat_id: int = 0) -> list[str]:
+    """Run the fast-gate decision and extract+store all detected intents.
+    If the top intent is 'query', fetch from DB instead of storing.
+    """
+    # Query intent → retrieval, not storage
+    if classifications and classifications[0].intent == "query":
+        result = handle_query(text)
+        return [result]
+
     path = decide(text, classifications)
     lines = []
     for cls in classifications:
-        line = await _save_and_format(cls.intent, text, path)
+        if cls.intent in ("query", "other"):
+            continue
+        line = await _save_and_format(cls.intent, text, path, job_queue, chat_id)
         lines.append(line)
-    return lines
+    return lines or ["Saved!"]
 
 
 def _clarify_keyboard(storage_key: str) -> InlineKeyboardMarkup:
@@ -132,6 +167,7 @@ def _confirm_keyboard() -> InlineKeyboardMarkup:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _CHAT_IDS.add(update.effective_chat.id)
+    db.save_chat_id(update.effective_chat.id)
     await update.message.reply_text(
         "Hi! I'm your personal AI life manager.\n\n"
         "Just type anything naturally:\n"
@@ -139,21 +175,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  • spent ₹200 on lunch today\n"
         "  • will learn system design tomorrow\n\n"
         "Commands:\n"
+        "  /summary   — everything you've saved\n"
+        "  /today     — what's due today\n"
         "  /shopping  — your buy list\n"
         "  /learn     — your study list\n"
         "  /expenses  — this month's spending\n"
-        "  /today     — due today\n"
-        "  /done s5   — mark shopping item #5 done\n"
-        "        l3   — learning #3 | o2 — reminder #2"
+        "  /mail      — email yourself a full report\n\n"
+        "Completing tasks:\n"
+        "  /manage    — tap-select multiple items ✓\n"
+        "  /done s5   — mark one done\n"
+        "  /done s1 s2 l3   — several at once\n"
+        "  /done s1-s5      — a range\n"
+        "  /done all        — everything pending\n"
+        "  /clear     — permanently delete completed items"
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    _CHAT_IDS.add(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    _CHAT_IDS.add(chat_id)
+    db.save_chat_id(chat_id)  # persist for restart-survival
 
-    # Store pending text in user_data (keyed by a short slot name).
-    # Using user_data avoids stuffing text into callback_data (64-byte Telegram limit).
     context.user_data["pending"] = text
 
     thinking = await update.message.reply_text("...")
@@ -175,9 +218,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    jq = context.application.job_queue
+
     # ── MEDIUM confidence: save + ask for confirmation ────────────────────────
     if top.confidence < CONFIDENCE_HIGH:
-        lines = await _process(text, classifications)
+        lines = await _process(text, classifications, jq, chat_id)
         context.user_data["last_confirmation"] = "\n".join(lines)
         await update.message.reply_text(
             "\n".join(lines) + "\n\nWas that correct?",
@@ -186,7 +231,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── HIGH confidence: save silently ───────────────────────────────────────
-    lines = await _process(text, classifications)
+    lines = await _process(text, classifications, jq, chat_id)
     await update.message.reply_text("\n".join(lines))
 
 
@@ -203,7 +248,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Sorry, I lost that message. Please retype it.")
             return
         cls = [Classification(intent=intent, confidence=0.99)]
-        lines = await _process(text, cls)
+        chat_id = query.message.chat_id
+        jq = context.application.job_queue
+        lines = await _process(text, cls, jq, chat_id)
         await query.edit_message_text("\n".join(lines))
 
     # User confirmed medium-confidence save
@@ -218,6 +265,50 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "No problem! Pick the correct category:",
             reply_markup=_clarify_keyboard("pending"),
         )
+
+    # ── /manage interactions ─────────────────────────────────────────────────
+    elif data.startswith("mg:"):
+        action   = data[3:]
+        items    = context.user_data.get("mg_items", [])
+        selected = context.user_data.get("mg_selected", set())
+
+        if action == "cancel":
+            context.user_data.pop("mg_items", None)
+            context.user_data.pop("mg_selected", None)
+            await query.edit_message_text("Cancelled — nothing changed.")
+            return
+
+        if action == "apply":
+            if not selected:
+                await query.answer("Nothing selected yet", show_alert=True)
+                return
+            applied = []
+            for key in sorted(selected):
+                parsed = _parse_id(key)
+                if parsed:
+                    db.mark_done(*parsed)
+                    applied.append(key)
+            context.user_data.pop("mg_items", None)
+            context.user_data.pop("mg_selected", None)
+            await query.edit_message_text(
+                f"Marked {len(applied)} item(s) done: {', '.join(applied)}"
+            )
+            return
+
+        # Toggle one item's checkbox
+        selected.symmetric_difference_update({action})
+        context.user_data["mg_selected"] = selected
+        await query.edit_message_reply_markup(
+            reply_markup=_manage_keyboard(items, selected)
+        )
+
+    # ── /clear confirmation ──────────────────────────────────────────────────
+    elif data == "clr:yes":
+        removed = db.purge_done()
+        await query.edit_message_text(f"Deleted {removed} completed item(s).")
+
+    elif data == "clr:no":
+        await query.edit_message_text("Cancelled — nothing deleted.")
 
 
 async def cmd_shopping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -286,22 +377,213 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full dashboard — everything the user has saved, grouped by category."""
+    sections = []
+
+    # ── Stats header ─────────────────────────────────────────────────────────
+    stats = db.get_summary_stats()
+    month_label = date.today().strftime("%B %Y")
+    sections.append(
+        f"📊  Your Summary\n"
+        f"  🛒 {stats['shopping']} shopping item(s) pending\n"
+        f"  📚 {stats['learning']} learning item(s) pending\n"
+        f"  📌 {stats['reminders']} reminder(s) pending\n"
+        f"  💸 ₹{stats['expense_total']:.0f} spent this month ({stats['expense_count']} entries)"
+    )
+
+    # ── Shopping list ─────────────────────────────────────────────────────────
+    s_rows = db.get_shopping_list()
+    if s_rows:
+        lines = ["🛒  Shopping List"]
+        for r in s_rows:
+            items = json.loads(r["items"])
+            lines.append(f"  [s{r['id']}]  {', '.join(items)}  →  {_fmt_date(r['date'])}")
+        sections.append("\n".join(lines))
+
+    # ── Learning list ─────────────────────────────────────────────────────────
+    l_rows = db.get_learning_list()
+    if l_rows:
+        lines = ["📚  Learning List"]
+        for r in l_rows:
+            res = f" ({r['resource']})" if r.get("resource") else ""
+            lines.append(f"  [l{r['id']}]  {r['topic']}{res}  →  {_fmt_date(r['date'])}")
+        sections.append("\n".join(lines))
+
+    # ── Reminders ─────────────────────────────────────────────────────────────
+    o_rows = db.get_others_list()
+    if o_rows:
+        lines = ["📌  Reminders"]
+        for r in o_rows:
+            lines.append(f"  [o{r['id']}]  {r['description']}  →  {_fmt_date(r['date'])}")
+        sections.append("\n".join(lines))
+
+    # ── Expenses this month ───────────────────────────────────────────────────
+    e_rows = db.get_expenses()
+    if e_rows:
+        total = sum(r["amount"] for r in e_rows)
+        lines = [f"💸  Expenses — {month_label}   Total: ₹{total:.0f}"]
+        for r in e_rows[:10]:
+            lines.append(f"  {r['date']}  ₹{r['amount']:.0f}  [{r['category']}]  {r['description'][:30]}")
+        if len(e_rows) > 10:
+            lines.append(f"  ... and {len(e_rows)-10} more. Use /expenses for full list.")
+        sections.append("\n".join(lines))
+
+    if len(sections) == 1:  # only stats header, nothing else
+        sections.append("Nothing saved yet! Just type anything and I'll remember it.")
+
+    sections.append("─────\nUse /done <id> to mark items complete.")
+    await update.message.reply_text("\n\n".join(sections))
+
+
+async def cmd_mail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a full HTML report to the configured email address."""
+    await update.message.reply_text("Sending report to your email...")
+    result = send_report()
+    await update.message.reply_text(result)
+
+
+def _parse_id(raw: str) -> tuple[str, int] | None:
+    """'s5' → ('shopping', 5). Returns None if malformed."""
+    raw = raw.lower().strip()
+    if len(raw) < 2:
+        return None
+    table = _PREFIX_MAP.get(raw[0])
+    num = raw[1:]
+    if not table or not num.isdigit():
+        return None
+    return table, int(num)
+
+
+def _expand_args(args: list[str]) -> list[str]:
+    """Expand range syntax: 's1-s4' → ['s1','s2','s3','s4']. Passes others through."""
+    out = []
+    for a in args:
+        a = a.lower().strip()
+        if "-" in a:
+            lo, hi = a.split("-", 1)
+            p1 = _parse_id(lo)
+            # allow both 's1-s4' and 's1-4'
+            p2 = _parse_id(hi) if not hi.isdigit() else (p1[0] if p1 else None, int(hi))
+            if p1 and p2 and p1[0] == p2[0] and p1[1] <= p2[1]:
+                prefix = a[0]
+                out.extend(f"{prefix}{n}" for n in range(p1[1], p2[1] + 1))
+                continue
+        out.append(a)
+    return out
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "Usage: /done <prefix><id>\n"
-            "Examples: /done s5  /done l3  /done o2\n"
-            "Prefixes: s=shopping  l=learning  o=reminder"
+            "Usage: /done <id> [<id> ...]\n\n"
+            "  /done s5              one item\n"
+            "  /done s1 s2 l3 o2     several at once\n"
+            "  /done s1-s5           a range\n"
+            "  /done all             everything pending\n"
+            "  /done all s           all shopping items\n\n"
+            "Prefixes: s=shopping  l=learning  o=reminder\n"
+            "Or use /manage to tap-select instead of typing."
         )
         return
-    raw = context.args[0].lower().strip()
-    prefix, num = raw[0], raw[1:]
-    table = _PREFIX_MAP.get(prefix)
-    if not table or not num.isdigit():
-        await update.message.reply_text("Invalid format. Example: /done s5")
+
+    args = [a.lower().strip() for a in context.args]
+
+    # ── "all" forms ──────────────────────────────────────────────────────────
+    if args[0] == "all":
+        only = _PREFIX_MAP.get(args[1][0]) if len(args) > 1 else None
+        items = db.get_all_pending(limit=500)
+        targets = [i for i in items if only is None or i["tbl"] == only]
+        for it in targets:
+            db.mark_done(it["tbl"], it["id"])
+        label = only or "all categories"
+        await update.message.reply_text(
+            f"Marked {len(targets)} item(s) done in {label}." if targets
+            else "Nothing pending to mark."
+        )
         return
-    db.mark_done(table, int(num))
-    await update.message.reply_text(f"Marked [{raw}] as done!")
+
+    # ── explicit IDs / ranges ────────────────────────────────────────────────
+    ok, bad = [], []
+    for raw in _expand_args(args):
+        parsed = _parse_id(raw)
+        if not parsed:
+            bad.append(raw)
+            continue
+        try:
+            db.mark_done(*parsed)
+            ok.append(raw)
+        except Exception:
+            bad.append(raw)
+
+    lines = []
+    if ok:
+        lines.append(f"Marked done: {', '.join(ok)}")
+    if bad:
+        lines.append(f"Couldn't parse: {', '.join(bad)}")
+    await update.message.reply_text("\n".join(lines) or "Nothing to do.")
+
+
+# ── /manage — tap-to-select ───────────────────────────────────────────────────
+
+_ICON = {"shopping": "🛒", "learning": "📚", "others": "📌"}
+_PFX  = {"shopping": "s", "learning": "l", "others": "o"}
+
+
+def _item_label(it: dict) -> str:
+    label = it["label"] or ""
+    if it["tbl"] == "shopping":
+        try:
+            label = ", ".join(json.loads(label))
+        except Exception:
+            pass
+    return label[:28]
+
+
+def _manage_keyboard(items: list[dict], selected: set[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for it in items:
+        key = f"{_PFX[it['tbl']]}{it['id']}"
+        box = "☑" if key in selected else "☐"
+        rows.append([InlineKeyboardButton(
+            f"{box}  {_ICON[it['tbl']]} {_item_label(it)}",
+            callback_data=f"mg:{key}",
+        )])
+    rows.append([
+        InlineKeyboardButton(f"✓ Mark Done ({len(selected)})", callback_data="mg:apply"),
+        InlineKeyboardButton("✗ Cancel",                       callback_data="mg:cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    items = db.get_all_pending()
+    if not items:
+        await update.message.reply_text("Nothing pending — you're all clear!")
+        return
+    context.user_data["mg_items"]    = items
+    context.user_data["mg_selected"] = set()
+    await update.message.reply_text(
+        "Tap to select, then press Mark Done:",
+        reply_markup=_manage_keyboard(items, set()),
+    )
+
+
+# ── /clear — purge completed rows ─────────────────────────────────────────────
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = db.count_done()
+    if n == 0:
+        await update.message.reply_text("No completed items to clear.")
+        return
+    await update.message.reply_text(
+        f"Permanently delete {n} completed item(s) from the database?\n"
+        "This cannot be undone.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Yes, delete", callback_data="clr:yes"),
+            InlineKeyboardButton("Cancel",      callback_data="clr:no"),
+        ]]),
+    )
 
 
 # ── Scheduler job ─────────────────────────────────────────────────────────────
@@ -316,23 +598,27 @@ async def _daily_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
+async def _post_init(app):
+    """Called once after the bot connects — restore all timed reminders from DB."""
+    restore_all(app.job_queue)
+
+
 def main():
     db.init_db()
 
-    import os
-    print("Token loaded:", repr(TELEGRAM_TOKEN))
-    print("Current dir:", os.getcwd())
-    print(".env exists:", os.path.exists(".env"))
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
 
     # Register handlers
     app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("summary",  cmd_summary))
+    app.add_handler(CommandHandler("mail",     cmd_mail))
     app.add_handler(CommandHandler("shopping", cmd_shopping))
     app.add_handler(CommandHandler("learn",    cmd_learn))
     app.add_handler(CommandHandler("expenses", cmd_expenses))
     app.add_handler(CommandHandler("today",    cmd_today))
     app.add_handler(CommandHandler("done",     cmd_done))
+    app.add_handler(CommandHandler("manage",   cmd_manage))
+    app.add_handler(CommandHandler("clear",    cmd_clear))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

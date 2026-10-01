@@ -22,28 +22,32 @@ from config import GROQ_API_KEY
 logger = logging.getLogger(__name__)
 _client = Groq(api_key=GROQ_API_KEY)
 
-_BASE = "Today is {today}. Resolve relative dates (tomorrow, weekend, next Monday, etc.) to YYYY-MM-DD."
+_BASE = (
+    "Today is {today}, current time is {now} (IST, 24h). "
+    "Resolve ALL relative dates AND times to absolute values. "
+    "'in 10 min' → compute actual HH:MM from now. '6 PM' → '18:00'."
+)
 
 _PROMPTS = {
     "shopping": _BASE + """
 Extract shopping details. Return JSON:
-{"items": ["item1", "item2"], "date": "YYYY-MM-DD or null", "platform": "amazon/flipkart/etc or null", "notes": "extra info or null"}""",
+{{"items": ["item1", "item2"], "date": "YYYY-MM-DD or null", "time": "HH:MM in 24h or null if no specific time", "platform": "amazon/flipkart/etc or null", "notes": "extra info or null"}}""",
 
     "learning": _BASE + """
 Extract study/learning details. Return JSON:
-{"topic": "what to learn", "date": "YYYY-MM-DD or null", "resource": "book/video/course name or null", "notes": "extra info or null"}""",
+{{"topic": "what to learn", "date": "YYYY-MM-DD or null", "time": "HH:MM in 24h or null if no specific time", "resource": "book/video/course name or null", "notes": "extra info or null"}}""",
 
     "expense": _BASE + """
 Extract expense details. Return JSON:
-{"amount": 123.45, "currency": "INR", "category": "food|transport|grocery|shopping|utilities|health|entertainment|other", "description": "brief description", "date": "YYYY-MM-DD"}""",
+{{"amount": 123.45, "currency": "INR", "category": "food|transport|grocery|shopping|utilities|health|entertainment|other", "description": "brief description", "date": "YYYY-MM-DD"}}""",
 
     "other": _BASE + """
 Extract reminder/task details. Return JSON:
-{"description": "what to remember or do", "date": "YYYY-MM-DD or null", "notes": "extra info or null"}""",
+{{"description": "what to remember or do", "date": "YYYY-MM-DD or null", "time": "HH:MM in 24h or null if no specific time", "notes": "extra info or null"}}""",
 
     "reminder": _BASE + """
 Extract reminder details. Return JSON:
-{"description": "what to remember or do", "date": "YYYY-MM-DD or null", "notes": "extra info or null"}""",
+{{"description": "what to remember or do", "date": "YYYY-MM-DD or null", "time": "HH:MM in 24h or null if no specific time", "notes": "extra info or null"}}""",
 }
 
 
@@ -57,11 +61,30 @@ def _parse_date(value: Optional[str]) -> Optional[date]:
         return None
 
 
+def _parse_time(value: Optional[str]) -> Optional[str]:
+    """Normalise extracted time string to HH:MM, or return None."""
+    if not value or value in ("null", "None", ""):
+        return None
+    try:
+        parts = value.strip().split(":")
+        if len(parts) == 2:
+            h, m = int(parts[0]), int(parts[1])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return f"{h:02d}:{m:02d}"
+    except Exception:
+        pass
+    return None
+
+
 def _call(prompt: str, text: str) -> dict:
+    from datetime import datetime
+    now_str = datetime.now().strftime("%H:%M")
     resp = _client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[
-            {"role": "system", "content": prompt.format(today=date.today().isoformat())},
+            {"role": "system", "content": prompt.format(
+                today=date.today().isoformat(), now=now_str
+            )},
             {"role": "user",   "content": text},
         ],
         response_format={"type": "json_object"},
@@ -76,6 +99,7 @@ def extract_shopping(text: str) -> ShoppingEntry:
     return ShoppingEntry(
         items=data.get("items") or [text],
         date=_parse_date(data.get("date")),
+        reminder_time=_parse_time(data.get("time")),
         platform=data.get("platform"),
         notes=data.get("notes"),
         raw_text=text,
@@ -87,6 +111,7 @@ def extract_learning(text: str) -> LearningEntry:
     return LearningEntry(
         topic=data.get("topic") or text,
         date=_parse_date(data.get("date")),
+        reminder_time=_parse_time(data.get("time")),
         resource=data.get("resource"),
         notes=data.get("notes"),
         raw_text=text,
@@ -106,11 +131,11 @@ def extract_expense(text: str) -> ExpenseEntry:
 
 
 def extract_other(text: str) -> OtherEntry:
-    intent_key = "other"
-    data = _call(_PROMPTS[intent_key], text)
+    data = _call(_PROMPTS["other"], text)
     return OtherEntry(
         description=data.get("description") or text,
         date=_parse_date(data.get("date")),
+        reminder_time=_parse_time(data.get("time")),
         notes=data.get("notes"),
         raw_text=text,
     )
